@@ -791,6 +791,9 @@ func formatGraphOutput(graph *IssueGraph) string {
 	sb.WriteString(graph.Summary)
 	sb.WriteString("\n")
 
+	// Legend for node types
+	sb.WriteString("Node types: epic (large initiative), batch (has sub-issues), task (regular issue), pr (pull request)\n\n")
+
 	// Nodes section
 	sb.WriteString(fmt.Sprintf("NODES (%d total)\n", len(graph.Nodes)))
 	sb.WriteString("===============\n")
@@ -807,9 +810,9 @@ func formatGraphOutput(graph *IssueGraph) string {
 		}
 	}
 
-	// Edges section - parent/child relationships
-	sb.WriteString("\nEDGES (parent → child)\n")
-	sb.WriteString("======================\n")
+	// Edges section - parent/child relationships (sub-issues, closes/fixes)
+	sb.WriteString("\nSUB-ISSUES (parent → child)\n")
+	sb.WriteString("===========================\n")
 	parentChildEdges := make([]GraphEdge, 0)
 	relatedEdges := make([]GraphEdge, 0)
 	for _, edge := range graph.Edges {
@@ -833,20 +836,26 @@ func formatGraphOutput(graph *IssueGraph) string {
 		}
 	}
 
-	for _, edge := range parentChildEdges {
-		fromRef := formatNodeRef(edge.FromOwner, edge.FromRepo, edge.FromNumber, graph.FocusOwner, graph.FocusRepo)
-		toRef := formatNodeRef(edge.ToOwner, edge.ToRepo, edge.ToNumber, graph.FocusOwner, graph.FocusRepo)
-		sb.WriteString(fmt.Sprintf("%s → %s\n", fromRef, toRef))
+	if len(parentChildEdges) == 0 {
+		sb.WriteString("(none)\n")
+	} else {
+		for _, edge := range parentChildEdges {
+			fromRef := formatNodeRef(edge.FromOwner, edge.FromRepo, edge.FromNumber, graph.FocusOwner, graph.FocusRepo)
+			toRef := formatNodeRef(edge.ToOwner, edge.ToRepo, edge.ToNumber, graph.FocusOwner, graph.FocusRepo)
+			sb.WriteString(fmt.Sprintf("%s → %s\n", fromRef, toRef))
+		}
 	}
 
-	// Related section
-	if len(relatedEdges) > 0 {
-		sb.WriteString("\nRELATED\n")
-		sb.WriteString("=======\n")
+	// Related section (cross-references from timeline, body mentions)
+	sb.WriteString("\nCROSS-REFERENCES (mentioned/referenced)\n")
+	sb.WriteString("=======================================\n")
+	if len(relatedEdges) == 0 {
+		sb.WriteString("(none)\n")
+	} else {
 		for _, edge := range relatedEdges {
 			fromRef := formatNodeRef(edge.FromOwner, edge.FromRepo, edge.FromNumber, graph.FocusOwner, graph.FocusRepo)
 			toRef := formatNodeRef(edge.ToOwner, edge.ToRepo, edge.ToNumber, graph.FocusOwner, graph.FocusRepo)
-			sb.WriteString(fmt.Sprintf("%s ~ %s\n", fromRef, toRef))
+			sb.WriteString(fmt.Sprintf("%s ↔ %s\n", fromRef, toRef))
 		}
 	}
 
