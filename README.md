@@ -718,6 +718,7 @@ The following sets of tools are available:
   - `repo`: Repository name (string, required)
 
 - **issue_graph** - Get issue relationship graph
+  - `focus`: Which node type to focus on: 'provided' (default) uses the specified issue/PR, 'epic' shifts focus to the nearest epic in the hierarchy, 'batch' shifts focus to the nearest batch/parent issue (string, optional)
   - `issue_number`: Issue or pull request number to build the graph from (number, required)
   - `owner`: Repository owner (string, required)
   - `repo`: Repository name (string, required)

@@ -230,7 +230,15 @@ func fragmentToIssue(fragment IssueFragment) *github.Issue {
 // GetIssue creates a tool to get details of a specific issue in a GitHub repository.
 func IssueRead(getClient GetClientFn, getGQLClient GetGQLClientFn, cache *lockdown.RepoAccessCache, t translations.TranslationHelperFunc, flags FeatureFlags) (tool mcp.Tool, handler server.ToolHandlerFunc) {
 	return mcp.NewTool("issue_read",
-			mcp.WithDescription(t("TOOL_ISSUE_READ_DESCRIPTION", "Get information about a specific issue in a GitHub repository.")),
+			mcp.WithDescription(t("TOOL_ISSUE_READ_DESCRIPTION", `Get detailed information about a single issue: full body, comments, sub-issues, or labels.
+
+**USE issue_graph INSTEAD when user asks about:**
+- Status, updates, or progress on issues/PRs/epics
+- Project overview or how work is going
+- Parent issues, sub-issues, or work hierarchy
+- Related or blocking issues
+
+issue_read is for: reading the full issue body, fetching comments, listing sub-issues of a known parent, or getting label details - AFTER you already know which specific issue you need.`)),
 			mcp.WithToolAnnotation(mcp.ToolAnnotation{
 				Title:        t("TOOL_ISSUE_READ_USER_TITLE", "Get issue details"),
 				ReadOnlyHint: ToBoolPtr(true),

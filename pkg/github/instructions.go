@@ -63,9 +63,37 @@ Before creating a pull request, search for pull request templates in the reposit
 	case "issues":
 		return `## Issues
 
-Check 'list_issue_types' first for organizations to use proper issue types. Use 'search_issues' before creating new issues to avoid duplicates. Always set 'state_reason' when closing issues.
+**CRITICAL: For ANY question about issue/PR/epic status, updates, or progress - ALWAYS call 'issue_graph' FIRST before any other tool.**
 
-Use 'issue_graph' early when working on an issue to understand its context, hierarchy (epic → batch → task → PR), and related work. After identifying important issues in the graph, use 'issue_read' to get full details of specific issues.`
+'issue_graph' is the FASTEST PATH to project status - one call returns the entire work hierarchy (epic → batches → tasks → PRs) instead of multiple separate API calls.
+
+Trigger phrases that REQUIRE 'issue_graph' as the FIRST tool call:
+- "update on..." / "status of..." / "progress on..." / "tell me about..."
+- "what's happening with..." / "how is... going" / "state of..."
+- "project status" / "how is the project going" / "overall progress"
+- "epic" / "parent issue" / "sub-issues" / "blocking" / "depends on"
+- ANY issue/PR number reference when asking for status or updates
+
+Example: User asks "give me an update on issue #123" → Call issue_graph(owner, repo, 123) FIRST.
+Example: User asks "what's the status of the project" → Call issue_graph with the epic/tracking issue number.
+
+The 'issue_graph' tool returns in ONE call:
+- Full hierarchy: epic → batch → task → PR relationships across the entire project
+- All sub-issues and "closes/fixes" references  
+- Status updates extracted from issue bodies/comments
+- Cross-references and related work
+- Open/closed state of all related items
+
+Use focus="epic" to automatically find and focus on the parent epic of any issue.
+
+ONLY AFTER calling 'issue_graph', use other tools:
+- 'issue_read' for full details of specific issues identified in the graph
+- 'search_issues' to find related issues not in the graph
+
+For creating/modifying issues:
+- Check 'list_issue_types' first for organizations to use proper issue types
+- Use 'search_issues' before creating new issues to avoid duplicates
+- Always set 'state_reason' when closing issues`
 	case "discussions":
 		return `## Discussions
 		

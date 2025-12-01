@@ -3,9 +3,18 @@
     "title": "Get issue relationship graph",
     "readOnlyHint": true
   },
-  "description": "Get a graph representation of an issue or pull request and its related issues/PRs.\n\nThis tool helps understand the relationships between issues and PRs in a repository, especially useful for:\n- Understanding the scope of work for an issue or PR\n- Planning implementation for a task that's part of a larger epic\n- Identifying blockers or dependencies\n- Finding related work that might conflict or overlap\n- Understanding why a piece of work exists (tracing to parent epic)\n\nThe graph shows:\n- Node types: epic (large initiatives), batch (parent issues), task (regular issues), pr (pull requests)\n- Parent/child relationships from sub-issues and \"closes/fixes\" references\n- Related issues mentioned in bodies\n\nCall this tool early when working on an issue to gather appropriate context about the work hierarchy.",
+  "description": "**PRIMARY TOOL FOR ISSUE/PR/PROJECT STATUS** - Returns the entire work hierarchy in ONE call. Use this FIRST before issue_read or other tools.\n\nFASTEST PATH TO PROJECT STATUS: One call returns all related issues, PRs, and their states - no need for multiple API calls.\n\nMUST USE THIS TOOL FIRST WHEN USER ASKS:\n- \"update on...\" / \"status of...\" / \"progress on...\" / \"tell me about...\"\n- \"what's happening with...\" / \"how is... going\" / \"state of...\"\n- \"project status\" / \"overall progress\" / \"how is the epic going\"\n- \"epic\" / \"parent issue\" / \"sub-issues\" / \"blocking\" / \"depends on\"\n- ANY request for status on work that might span multiple issues\n\nDO NOT use issue_read or list_issues first for status questions - issue_graph returns everything in one call.\n\nReturns a comprehensive view including:\n- Node types: epic (large initiatives), batch (parent issues), task (regular issues), pr (pull requests)\n- Full hierarchy: epic → batch → task → PR relationships across the ENTIRE project\n- Sub-issues and \"closes/fixes\" references\n- Cross-references and related work\n- Status updates extracted from issue bodies and comments\n- Open/closed/merged state of ALL related items\n\nUse focus=\"epic\" to automatically find and focus on the parent epic of any issue.",
   "inputSchema": {
     "properties": {
+      "focus": {
+        "description": "Which node type to focus on: 'provided' (default) uses the specified issue/PR, 'epic' shifts focus to the nearest epic in the hierarchy, 'batch' shifts focus to the nearest batch/parent issue",
+        "enum": [
+          "provided",
+          "epic",
+          "batch"
+        ],
+        "type": "string"
+      },
       "issue_number": {
         "description": "Issue or pull request number to build the graph from",
         "type": "number"

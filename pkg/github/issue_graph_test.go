@@ -25,6 +25,7 @@ func TestGetIssueGraph(t *testing.T) {
 
 	tool, _ := GetIssueGraph(
 		stubGetClientFn(mockClient),
+		stubGetGQLClientFn(mockGQLClient),
 		cache,
 		translations.NullTranslationHelper,
 		stubFeatureFlags(map[string]bool{"lockdown-mode": false}),
@@ -81,6 +82,7 @@ func TestGetIssueGraph_SingleIssue(t *testing.T) {
 
 	_, handler := GetIssueGraph(
 		stubGetClientFn(mockClient),
+		stubGetGQLClientFn(mockGQLClient),
 		cache,
 		translations.NullTranslationHelper,
 		stubFeatureFlags(map[string]bool{"lockdown-mode": false}),
@@ -167,6 +169,35 @@ func TestExtractIssueReferences(t *testing.T) {
 				{Owner: "owner", Repo: "repo", Number: 200, IsParent: true},
 			},
 		},
+		{
+			name:         "full github issue URL",
+			text:         "Related to https://github.com/other/project/issues/789",
+			defaultOwner: "owner",
+			defaultRepo:  "repo",
+			expected: []IssueReference{
+				{Owner: "other", Repo: "project", Number: 789, IsParent: false},
+			},
+		},
+		{
+			name:         "full github PR URL",
+			text:         "See https://github.com/other/project/pull/456 for the fix",
+			defaultOwner: "owner",
+			defaultRepo:  "repo",
+			expected: []IssueReference{
+				{Owner: "other", Repo: "project", Number: 456, IsParent: false},
+			},
+		},
+		{
+			name:         "mixed URL and shorthand references",
+			text:         "Fixes #100, see https://github.com/other/repo/issues/200 and other/project#300",
+			defaultOwner: "owner",
+			defaultRepo:  "repo",
+			expected: []IssueReference{
+				{Owner: "owner", Repo: "repo", Number: 100, IsParent: true},
+				{Owner: "other", Repo: "project", Number: 300, IsParent: false},
+				{Owner: "other", Repo: "repo", Number: 200, IsParent: false},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -244,6 +275,7 @@ func TestClassifyNode(t *testing.T) {
 		isPR         bool
 		labels       []string
 		title        string
+		issueType    string
 		hasSubIssues bool
 		expected     NodeType
 	}{
@@ -269,6 +301,14 @@ func TestClassifyNode(t *testing.T) {
 			expected: NodeTypeEpic,
 		},
 		{
+			name:      "epic by issue type",
+			isPR:      false,
+			labels:    []string{},
+			title:     "Major initiative",
+			issueType: "Epic",
+			expected:  NodeTypeEpic,
+		},
+		{
 			name:         "batch issue",
 			isPR:         false,
 			labels:       []string{},
@@ -287,7 +327,7 @@ func TestClassifyNode(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := classifyNode(tc.isPR, tc.labels, tc.title, tc.hasSubIssues)
+			result := classifyNode(tc.isPR, tc.labels, tc.title, tc.issueType, tc.hasSubIssues)
 			assert.Equal(t, tc.expected, result)
 		})
 	}
@@ -450,6 +490,7 @@ func TestIssueGraphWithSubIssues(t *testing.T) {
 
 	_, handler := GetIssueGraph(
 		stubGetClientFn(mockClient),
+		stubGetGQLClientFn(mockGQLClient),
 		cache,
 		translations.NullTranslationHelper,
 		stubFeatureFlags(map[string]bool{"lockdown-mode": false}),
@@ -470,4 +511,136 @@ func TestIssueGraphWithSubIssues(t *testing.T) {
 	textContent := getTextResult(t, result)
 	assert.Contains(t, textContent.Text, "#100")
 	assert.Contains(t, textContent.Text, "Parent Issue")
+}
+
+func TestFindCrossReferencedNodeWithAncestors(t *testing.T) {
+	// Test scenario: PR #461 is cross-referenced by task #886, and #886's parent is batch #871
+	// When searching for batch from #461, we should find #871 via the ancestor chain
+
+	// Create a mock crawler with the graph structure
+	crawler := &graphCrawler{
+		focusOwner:     "github",
+		focusRepo:      "github-mcp-server-remote",
+		focusNumber:    461,
+		originalOwner:  "github",
+		originalRepo:   "github-mcp-server-remote",
+		originalNumber: 461,
+		nodes:          make(map[string]*GraphNode),
+		edges:          make([]GraphEdge, 0),
+		parentMap:      make(map[string]string),
+	}
+
+	// Add nodes: PR #461 (focus), task #886, batch #871
+	prNode := &GraphNode{
+		Owner:    "github",
+		Repo:     "github-mcp-server-remote",
+		Number:   461,
+		NodeType: NodeTypePR,
+		State:    "merged",
+		Title:    "Implement initial scope challenge",
+	}
+	taskNode := &GraphNode{
+		Owner:    "github",
+		Repo:     "copilot-agent-services",
+		Number:   886,
+		NodeType: NodeTypeTask,
+		State:    "closed",
+		Title:    "Add initial scope challenge to MCP remote server",
+	}
+	batchNode := &GraphNode{
+		Owner:    "github",
+		Repo:     "copilot-agent-services",
+		Number:   871,
+		NodeType: NodeTypeBatch,
+		State:    "open",
+		Title:    "[Batch] Support scope challenge in remote MCP",
+	}
+
+	crawler.nodes[nodeKey("github", "github-mcp-server-remote", 461)] = prNode
+	crawler.nodes[nodeKey("github", "copilot-agent-services", 886)] = taskNode
+	crawler.nodes[nodeKey("github", "copilot-agent-services", 871)] = batchNode
+
+	// Add edge: task #886 cross-references PR #461
+	crawler.edges = append(crawler.edges, GraphEdge{
+		FromOwner:  "github",
+		FromRepo:   "copilot-agent-services",
+		FromNumber: 886,
+		ToOwner:    "github",
+		ToRepo:     "github-mcp-server-remote",
+		ToNumber:   461,
+		Relation:   RelationTypeRelated,
+	})
+
+	// Add parent relationship: batch #871 is parent of task #886
+	taskKey := nodeKey("github", "copilot-agent-services", 886)
+	batchKey := nodeKey("github", "copilot-agent-services", 871)
+	crawler.parentMap[taskKey] = batchKey
+
+	// Test: findCrossReferencedNode should find batch #871 by traversing ancestors of #886
+	prKey := nodeKey("github", "github-mcp-server-remote", 461)
+	foundNode := crawler.findCrossReferencedNode(prKey, NodeTypeBatch)
+
+	require.NotNil(t, foundNode, "Should find batch node via cross-ref ancestor traversal")
+	assert.Equal(t, "github", foundNode.Owner)
+	assert.Equal(t, "copilot-agent-services", foundNode.Repo)
+	assert.Equal(t, 871, foundNode.Number)
+	assert.Equal(t, NodeTypeBatch, foundNode.NodeType)
+}
+
+func TestFindBestFocusCrossRepoAncestors(t *testing.T) {
+	// Similar test but through the findBestFocus interface
+
+	crawler := &graphCrawler{
+		focusOwner:     "github",
+		focusRepo:      "github-mcp-server-remote",
+		focusNumber:    461,
+		originalOwner:  "github",
+		originalRepo:   "github-mcp-server-remote",
+		originalNumber: 461,
+		nodes:          make(map[string]*GraphNode),
+		edges:          make([]GraphEdge, 0),
+		parentMap:      make(map[string]string),
+	}
+
+	// Add nodes
+	crawler.nodes[nodeKey("github", "github-mcp-server-remote", 461)] = &GraphNode{
+		Owner:    "github",
+		Repo:     "github-mcp-server-remote",
+		Number:   461,
+		NodeType: NodeTypePR,
+	}
+	crawler.nodes[nodeKey("github", "copilot-agent-services", 886)] = &GraphNode{
+		Owner:    "github",
+		Repo:     "copilot-agent-services",
+		Number:   886,
+		NodeType: NodeTypeTask,
+	}
+	crawler.nodes[nodeKey("github", "copilot-agent-services", 871)] = &GraphNode{
+		Owner:    "github",
+		Repo:     "copilot-agent-services",
+		Number:   871,
+		NodeType: NodeTypeBatch,
+	}
+
+	// Add cross-reference edge
+	crawler.edges = append(crawler.edges, GraphEdge{
+		FromOwner:  "github",
+		FromRepo:   "copilot-agent-services",
+		FromNumber: 886,
+		ToOwner:    "github",
+		ToRepo:     "github-mcp-server-remote",
+		ToNumber:   461,
+		Relation:   RelationTypeRelated,
+	})
+
+	// Add parent relationship
+	crawler.parentMap[nodeKey("github", "copilot-agent-services", 886)] = nodeKey("github", "copilot-agent-services", 871)
+
+	// Test findBestFocus with "batch" should find #871
+	owner, repo, number, source := crawler.findBestFocus("batch")
+
+	assert.Equal(t, "github", owner)
+	assert.Equal(t, "copilot-agent-services", repo)
+	assert.Equal(t, 871, number)
+	assert.Equal(t, FocusSourceCrossRef, source)
 }

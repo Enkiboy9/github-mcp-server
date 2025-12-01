@@ -14,6 +14,7 @@ import (
 	"github.com/google/go-github/v79/github"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/shurcooL/githubv4"
 )
 
 const (
@@ -44,15 +45,17 @@ const (
 
 // GraphNode represents a node in the issue graph
 type GraphNode struct {
-	Owner       string   `json:"owner"`
-	Repo        string   `json:"repo"`
-	Number      int      `json:"number"`
-	NodeType    NodeType `json:"nodeType"`
-	State       string   `json:"state"`
-	Title       string   `json:"title"`
-	BodyPreview string   `json:"bodyPreview"`
-	Depth       int      `json:"depth"`
-	IsFocus     bool     `json:"isFocus"`
+	Owner        string   `json:"owner"`
+	Repo         string   `json:"repo"`
+	Number       int      `json:"number"`
+	NodeType     NodeType `json:"nodeType"`
+	State        string   `json:"state"`        // "open", "closed", or "merged" (for PRs)
+	StateReason  string   `json:"stateReason"`  // For issues: "completed", "not_planned", "duplicate", "reopened"; for PRs: empty or "merged"
+	StatusUpdate string   `json:"statusUpdate"` // For epics/batches: extracted status from body/comments (on-track, delayed, etc.)
+	Title        string   `json:"title"`
+	BodyPreview  string   `json:"bodyPreview"`
+	Depth        int      `json:"depth"`
+	IsFocus      bool     `json:"isFocus"`
 }
 
 // GraphEdge represents an edge in the issue graph
@@ -68,12 +71,19 @@ type GraphEdge struct {
 
 // IssueGraph represents the complete graph structure
 type IssueGraph struct {
-	FocusOwner  string      `json:"focusOwner"`
-	FocusRepo   string      `json:"focusRepo"`
-	FocusNumber int         `json:"focusNumber"`
-	Nodes       []GraphNode `json:"nodes"`
-	Edges       []GraphEdge `json:"edges"`
-	Summary     string      `json:"summary"`
+	FocusOwner   string        `json:"focusOwner"`
+	FocusRepo    string        `json:"focusRepo"`
+	FocusNumber  int           `json:"focusNumber"`
+	Nodes        []GraphNode   `json:"nodes"`
+	Edges        []GraphEdge   `json:"edges"`
+	Summary      string        `json:"summary"`
+	FocusProject []ProjectInfo `json:"focusProject,omitempty"` // Project info for the focus node
+}
+
+// ProjectInfo represents project name and status for an issue
+type ProjectInfo struct {
+	ProjectTitle string `json:"projectTitle"`
+	Status       string `json:"status,omitempty"`
 }
 
 // nodeKey creates a unique key for a node
@@ -100,6 +110,8 @@ var (
 	sameRepoRefRegex = regexp.MustCompile(`(?:^|[^\w])#(\d+)`)
 	// Matches owner/repo#123 style references (cross-repo)
 	crossRepoRefRegex = regexp.MustCompile(`([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)/([a-zA-Z0-9._-]+)#(\d+)`)
+	// Matches full GitHub URLs like https://github.com/owner/repo/issues/123 or /pull/123
+	githubURLRefRegex = regexp.MustCompile(`https?://(?:www\.)?github\.com/([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)/([a-zA-Z0-9._-]+)/(?:issues|pull)/(\d+)`)
 	// Matches "closes #123", "fixes #123", "resolves #123" patterns (PR linking to issue)
 	closesRefRegex = regexp.MustCompile(`(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:(?:([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)/([a-zA-Z0-9._-]+))?#(\d+))`)
 	// URL pattern to remove
@@ -113,6 +125,8 @@ var (
 	// Code block patterns to remove before extracting references
 	fencedCodeBlockRegex = regexp.MustCompile("(?s)```[^`]*```")
 	inlineCodeRegex      = regexp.MustCompile("`[^`]+`")
+	// Status patterns for epic/batch tracking (case-insensitive)
+	statusPatterns = regexp.MustCompile(`(?i)(?:^|\W)(status|on[- ]?track|delayed|at[- ]?risk|blocked|behind|ahead|eta|target|due|deadline)[:\s]+([^\n]{3,80})`)
 )
 
 // stripCodeBlocks removes fenced code blocks and inline code from text
@@ -159,6 +173,24 @@ func extractIssueReferences(text, defaultOwner, defaultRepo string) []IssueRefer
 
 	// Extract cross-repo references
 	for _, match := range crossRepoRefRegex.FindAllStringSubmatch(text, -1) {
+		owner := match[1]
+		repo := match[2]
+		number := 0
+		if _, err := fmt.Sscanf(match[3], "%d", &number); err == nil && number > 0 {
+			key := nodeKey(owner, repo, number)
+			if !seen[key] {
+				seen[key] = true
+				refs = append(refs, IssueReference{
+					Owner:  owner,
+					Repo:   repo,
+					Number: number,
+				})
+			}
+		}
+	}
+
+	// Extract full GitHub URL references (https://github.com/owner/repo/issues/123)
+	for _, match := range githubURLRefRegex.FindAllStringSubmatch(text, -1) {
 		owner := match[1]
 		repo := match[2]
 		number := 0
@@ -260,9 +292,15 @@ func getMaxLineLenForDepth(depth int) int {
 }
 
 // classifyNode determines the type of a node based on its properties
-func classifyNode(isPR bool, labels []string, title string, hasSubIssues bool) NodeType {
+func classifyNode(isPR bool, labels []string, title string, issueType string, hasSubIssues bool) NodeType {
 	if isPR {
 		return NodeTypePR
+	}
+
+	// Check for epic in issue type (GitHub's issue type feature)
+	issueTypeLower := strings.ToLower(issueType)
+	if strings.Contains(issueTypeLower, "epic") {
+		return NodeTypeEpic
 	}
 
 	// Check for epic label or title
@@ -284,14 +322,150 @@ func classifyNode(isPR bool, labels []string, title string, hasSubIssues bool) N
 	return NodeTypeTask
 }
 
+// extractStatusUpdate extracts status information from issue body and milestone
+// This is a lightweight "if lucky" check - returns empty string if no clear status found
+func extractStatusUpdate(body string, milestone *github.Milestone) string {
+	var statusParts []string
+
+	// Check milestone due date first (most reliable)
+	if milestone != nil && milestone.DueOn != nil {
+		dueDate := milestone.DueOn.Time
+		now := time.Now()
+		milestoneName := milestone.GetTitle()
+
+		if dueDate.Before(now) {
+			daysOverdue := int(now.Sub(dueDate).Hours() / 24)
+			if milestoneName != "" {
+				statusParts = append(statusParts, fmt.Sprintf("Milestone '%s' overdue by %d days", milestoneName, daysOverdue))
+			} else {
+				statusParts = append(statusParts, fmt.Sprintf("Milestone overdue by %d days", daysOverdue))
+			}
+		} else {
+			daysUntil := int(dueDate.Sub(now).Hours() / 24)
+			if milestoneName != "" {
+				statusParts = append(statusParts, fmt.Sprintf("Milestone '%s' due in %d days", milestoneName, daysUntil))
+			} else {
+				statusParts = append(statusParts, fmt.Sprintf("Milestone due in %d days", daysUntil))
+			}
+		}
+	}
+
+	// Quick scan of body for status keywords
+	if body != "" {
+		// Look for status patterns in body
+		matches := statusPatterns.FindAllStringSubmatch(body, 3) // limit to 3 matches
+		for _, match := range matches {
+			if len(match) >= 3 {
+				keyword := strings.ToLower(match[1])
+				value := strings.TrimSpace(match[2])
+				// Truncate long values
+				if len(value) > 60 {
+					value = value[:57] + "..."
+				}
+				// Normalize keyword
+				switch {
+				case keyword == "status":
+					statusParts = append(statusParts, fmt.Sprintf("Status: %s", value))
+				case strings.Contains(keyword, "track"):
+					statusParts = append(statusParts, fmt.Sprintf("On-track: %s", value))
+				case strings.Contains(keyword, "delay") || strings.Contains(keyword, "behind"):
+					statusParts = append(statusParts, fmt.Sprintf("Delayed: %s", value))
+				case strings.Contains(keyword, "risk"):
+					statusParts = append(statusParts, fmt.Sprintf("At-risk: %s", value))
+				case strings.Contains(keyword, "block"):
+					statusParts = append(statusParts, fmt.Sprintf("Blocked: %s", value))
+				case strings.Contains(keyword, "eta") || strings.Contains(keyword, "target") ||
+					strings.Contains(keyword, "due") || strings.Contains(keyword, "deadline"):
+					statusParts = append(statusParts, fmt.Sprintf("Target: %s", value))
+				}
+			}
+		}
+	}
+
+	if len(statusParts) == 0 {
+		return ""
+	}
+
+	// Limit to 2 status parts to keep it concise
+	if len(statusParts) > 2 {
+		statusParts = statusParts[:2]
+	}
+
+	return strings.Join(statusParts, "; ")
+}
+
+// extractStatusFromComments fetches recent comments and extracts status (for epics/batches only)
+// Only fetches 3 most recent comments to minimize API overhead
+func (gc *graphCrawler) extractStatusFromComments(ctx context.Context, owner, repo string, number int, issueBody string, milestone *github.Milestone) string {
+	// First try to get status from issue body and milestone
+	bodyStatus := extractStatusUpdate(issueBody, milestone)
+
+	// For epics/batches, also check recent comments (if context allows)
+	select {
+	case <-ctx.Done():
+		return bodyStatus // Context cancelled, return what we have
+	default:
+	}
+
+	// Fetch only the 3 most recent comments (sorted by created desc)
+	comments, resp, err := gc.client.Issues.ListComments(ctx, owner, repo, number, &github.IssueListCommentsOptions{
+		Sort:      github.Ptr("created"),
+		Direction: github.Ptr("desc"),
+		ListOptions: github.ListOptions{
+			PerPage: 3,
+		},
+	})
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil || len(comments) == 0 {
+		return bodyStatus
+	}
+
+	// Check recent comments for status updates
+	for _, comment := range comments {
+		if comment.Body == nil {
+			continue
+		}
+		commentStatus := extractStatusUpdate(*comment.Body, nil)
+		if commentStatus != "" {
+			// Found status in comment - prepend to body status if different
+			if bodyStatus == "" {
+				return commentStatus
+			}
+			if commentStatus != bodyStatus {
+				return commentStatus + " | " + bodyStatus
+			}
+			return bodyStatus
+		}
+	}
+
+	return bodyStatus
+}
+
+// FocusSource describes how the focus node was determined
+type FocusSource string
+
+const (
+	FocusSourceProvided  FocusSource = "provided"        // User-specified issue/PR
+	FocusSourceHierarchy FocusSource = "hierarchy"       // Found via sub-issues/closes chain
+	FocusSourceCrossRef  FocusSource = "cross-reference" // Found via mention/cross-reference
+)
+
 // graphCrawler manages the concurrent crawling of the issue graph
 type graphCrawler struct {
 	client           *github.Client
+	gqlClient        *githubv4.Client // GraphQL client for parent queries
 	cache            *lockdown.RepoAccessCache
 	flags            FeatureFlags
 	focusOwner       string
 	focusRepo        string
 	focusNumber      int
+	focusSource      FocusSource // how the focus was determined
+	focusRequested   string      // what focus type was requested ("epic", "batch", or "")
+	originalOwner    string      // original user-provided owner
+	originalRepo     string      // original user-provided repo
+	originalNumber   int         // original user-provided number
 	nodes            map[string]*GraphNode
 	edges            []GraphEdge
 	parentMap        map[string]string // maps child -> parent
@@ -300,14 +474,19 @@ type graphCrawler struct {
 	sem              chan struct{} // semaphore for concurrency control
 }
 
-func newGraphCrawler(client *github.Client, cache *lockdown.RepoAccessCache, flags FeatureFlags, owner, repo string, number int) *graphCrawler {
+func newGraphCrawler(client *github.Client, gqlClient *githubv4.Client, cache *lockdown.RepoAccessCache, flags FeatureFlags, owner, repo string, number int) *graphCrawler {
 	return &graphCrawler{
 		client:           client,
+		gqlClient:        gqlClient,
 		cache:            cache,
 		flags:            flags,
 		focusOwner:       owner,
 		focusRepo:        repo,
 		focusNumber:      number,
+		focusSource:      FocusSourceProvided,
+		originalOwner:    owner,
+		originalRepo:     repo,
+		originalNumber:   number,
 		nodes:            make(map[string]*GraphNode),
 		edges:            make([]GraphEdge, 0),
 		parentMap:        make(map[string]string),
@@ -415,23 +594,52 @@ func (gc *graphCrawler) fetchNode(ctx context.Context, owner, repo string, numbe
 		}
 	}
 
-	// Determine node type
-	nodeType := classifyNode(isPR, labels, issue.GetTitle(), hasSubIssues)
+	// Get issue type name if available
+	issueTypeName := ""
+	if issue.Type != nil {
+		issueTypeName = issue.Type.GetName()
+	}
 
-	// Get state
+	// Determine node type
+	nodeType := classifyNode(isPR, labels, issue.GetTitle(), issueTypeName, hasSubIssues)
+
+	// Get state and state reason
+	// For PRs: check if merged (via PullRequestLinks.MergedAt)
+	// For Issues: use StateReason (completed, not_planned, duplicate, reopened)
 	state := issue.GetState()
+	stateReason := ""
+
+	if isPR {
+		// Check if PR was merged
+		prLinks := issue.GetPullRequestLinks()
+		if prLinks != nil && !prLinks.GetMergedAt().IsZero() {
+			state = "merged"
+			stateReason = "merged"
+		}
+	} else if issue.StateReason != nil {
+		// For issues, get the state reason if available
+		stateReason = *issue.StateReason
+	}
+
+	// Extract status update for epics and batches (lightweight check)
+	var statusUpdate string
+	if nodeType == NodeTypeEpic || nodeType == NodeTypeBatch {
+		statusUpdate = gc.extractStatusFromComments(ctx, owner, repo, number, issue.GetBody(), issue.Milestone)
+	}
 
 	// Create node
 	node := &GraphNode{
-		Owner:       owner,
-		Repo:        repo,
-		Number:      number,
-		NodeType:    nodeType,
-		State:       state,
-		Title:       issue.GetTitle(),
-		BodyPreview: sanitizeBodyForGraph(issue.GetBody(), getBodyLinesForDepth(depth), getMaxLineLenForDepth(depth)),
-		Depth:       depth,
-		IsFocus:     strings.EqualFold(owner, gc.focusOwner) && strings.EqualFold(repo, gc.focusRepo) && number == gc.focusNumber,
+		Owner:        owner,
+		Repo:         repo,
+		Number:       number,
+		NodeType:     nodeType,
+		State:        state,
+		StateReason:  stateReason,
+		StatusUpdate: statusUpdate,
+		Title:        issue.GetTitle(),
+		BodyPreview:  sanitizeBodyForGraph(issue.GetBody(), getBodyLinesForDepth(depth), getMaxLineLenForDepth(depth)),
+		Depth:        depth,
+		IsFocus:      strings.EqualFold(owner, gc.focusOwner) && strings.EqualFold(repo, gc.focusRepo) && number == gc.focusNumber,
 	}
 
 	// Add to graph
@@ -501,6 +709,54 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 			continue
 		}
 
+		// For issues (not PRs), use GraphQL to fetch parent and sub-issues in one call
+		// This is more efficient than separate REST calls and handles cross-repo relationships
+		if !issue.IsPullRequest() && gc.gqlClient != nil {
+			if info := fetchIssueGraphQLInfo(ctx, gc.gqlClient, current.owner, current.repo, current.number); info != nil {
+				// Process parent
+				if info.Parent != nil {
+					parentKey := nodeKey(info.Parent.Owner, info.Parent.Repo, info.Parent.Number)
+
+					gc.mu.Lock()
+					gc.parentMap[key] = parentKey
+					gc.edges = append(gc.edges, GraphEdge{
+						FromOwner:  current.owner,
+						FromRepo:   current.repo,
+						FromNumber: current.number,
+						ToOwner:    info.Parent.Owner,
+						ToRepo:     info.Parent.Repo,
+						ToNumber:   info.Parent.Number,
+						Relation:   RelationTypeParent,
+					})
+					gc.mu.Unlock()
+
+					// Add parent to queue for crawling
+					queue = append(queue, crawlItem{info.Parent.Owner, info.Parent.Repo, info.Parent.Number, current.depth})
+				}
+
+				// Process sub-issues (can be cross-repo!)
+				for _, sub := range info.SubIssues {
+					subKey := nodeKey(sub.Owner, sub.Repo, sub.Number)
+
+					gc.mu.Lock()
+					gc.parentMap[subKey] = key
+					gc.edges = append(gc.edges, GraphEdge{
+						FromOwner:  current.owner,
+						FromRepo:   current.repo,
+						FromNumber: current.number,
+						ToOwner:    sub.Owner,
+						ToRepo:     sub.Repo,
+						ToNumber:   sub.Number,
+						Relation:   RelationTypeChild,
+					})
+					gc.mu.Unlock()
+
+					// Add to queue
+					queue = append(queue, crawlItem{sub.Owner, sub.Repo, sub.Number, current.depth + 1})
+				}
+			}
+		}
+
 		bodyRefs := extractIssueReferences(issue.GetBody(), current.owner, current.repo)
 
 		// Process references and add edges
@@ -544,42 +800,7 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 			queue = append(queue, crawlItem{ref.Owner, ref.Repo, ref.Number, current.depth + 1})
 		}
 
-		// Get sub-issues if this is an issue (not PR)
-		if !issue.IsPullRequest() {
-			subIssues, subResp, err := gc.client.SubIssue.ListByIssue(ctx, current.owner, current.repo, int64(current.number), &github.IssueListOptions{
-				ListOptions: github.ListOptions{PerPage: 100},
-			})
-			if err == nil {
-				for _, subIssue := range subIssues {
-					// SubIssue is a type alias for Issue, access Number field directly
-					if subIssue.Number == nil {
-						continue
-					}
-					subNumber := *subIssue.Number
-					subKey := nodeKey(current.owner, current.repo, subNumber)
-
-					// This node is parent of sub-issue
-					gc.mu.Lock()
-					gc.parentMap[subKey] = key
-					gc.edges = append(gc.edges, GraphEdge{
-						FromOwner:  current.owner,
-						FromRepo:   current.repo,
-						FromNumber: current.number,
-						ToOwner:    current.owner,
-						ToRepo:     current.repo,
-						ToNumber:   subNumber,
-						Relation:   RelationTypeChild,
-					})
-					gc.mu.Unlock()
-
-					// Add to queue
-					queue = append(queue, crawlItem{current.owner, current.repo, subNumber, current.depth + 1})
-				}
-			}
-			if subResp != nil {
-				_ = subResp.Body.Close()
-			}
-		}
+		// Note: Sub-issues are now fetched via GraphQL above (more efficient, handles cross-repo)
 
 		// Get cross-referenced issues from timeline
 		timelineEvents, timelineResp, err := gc.client.Issues.ListIssueTimeline(ctx, current.owner, current.repo, current.number, &github.ListOptions{
@@ -659,6 +880,169 @@ func edgeKey(e GraphEdge) string {
 		e.Relation)
 }
 
+// refocusTo changes the focus node after crawling has completed
+// This allows shifting focus to an epic or batch that was discovered
+func (gc *graphCrawler) refocusTo(owner, repo string, number int, source FocusSource) {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+
+	// Update focus
+	gc.focusOwner = owner
+	gc.focusRepo = repo
+	gc.focusNumber = number
+	gc.focusSource = source
+
+	// Update IsFocus on nodes
+	for key, node := range gc.nodes {
+		node.IsFocus = key == nodeKey(owner, repo, number)
+	}
+}
+
+// findBestFocus finds the best node to focus on based on the requested focus type.
+// Priority order:
+// 1. If original node is already the target type, use it
+// 2. Walk up explicit parent hierarchy (sub-issues, closes/fixes) for target type
+// 3. If looking for epic but only found batch in hierarchy, use the batch
+// 4. Fallback: scan cross-referenced nodes for the target type (best effort)
+// Returns owner, repo, number, and source of the best focus node.
+func (gc *graphCrawler) findBestFocus(focusType string) (string, string, int, FocusSource) {
+	gc.mu.RLock()
+	defer gc.mu.RUnlock()
+
+	originalKey := nodeKey(gc.focusOwner, gc.focusRepo, gc.focusNumber)
+
+	// Determine target node type
+	var targetType NodeType
+	switch focusType {
+	case "epic":
+		targetType = NodeTypeEpic
+	case "batch":
+		targetType = NodeTypeBatch
+	default:
+		return gc.focusOwner, gc.focusRepo, gc.focusNumber, FocusSourceProvided
+	}
+
+	// First, check if the original focus is already the target type
+	if node, exists := gc.nodes[originalKey]; exists && node.NodeType == targetType {
+		return gc.focusOwner, gc.focusRepo, gc.focusNumber, FocusSourceProvided
+	}
+
+	// Walk up the ancestor chain (explicit hierarchy) to find the nearest target type
+	ancestors := gc.findAncestorsUnlocked(originalKey)
+	for _, ancestorKey := range ancestors {
+		if node, exists := gc.nodes[ancestorKey]; exists && node.NodeType == targetType {
+			return node.Owner, node.Repo, node.Number, FocusSourceHierarchy
+		}
+	}
+
+	// If looking for epic and didn't find one in hierarchy, check for batch
+	if targetType == NodeTypeEpic {
+		for _, ancestorKey := range ancestors {
+			if node, exists := gc.nodes[ancestorKey]; exists && node.NodeType == NodeTypeBatch {
+				return node.Owner, node.Repo, node.Number, FocusSourceHierarchy
+			}
+		}
+	}
+
+	// Fallback: scan cross-referenced nodes for the target type
+	// This handles cases where an epic is linked via mention but not sub-issue/closes
+	crossRefTarget := gc.findCrossReferencedNode(originalKey, targetType)
+	if crossRefTarget != nil {
+		return crossRefTarget.Owner, crossRefTarget.Repo, crossRefTarget.Number, FocusSourceCrossRef
+	}
+
+	// If looking for epic via cross-ref, also accept a batch as fallback
+	if targetType == NodeTypeEpic {
+		crossRefBatch := gc.findCrossReferencedNode(originalKey, NodeTypeBatch)
+		if crossRefBatch != nil {
+			return crossRefBatch.Owner, crossRefBatch.Repo, crossRefBatch.Number, FocusSourceCrossRef
+		}
+	}
+
+	// No suitable focus found, keep original
+	return gc.focusOwner, gc.focusRepo, gc.focusNumber, FocusSourceProvided
+}
+
+// findCrossReferencedNode finds a node of the target type that is cross-referenced
+// from the original node (via RelationTypeRelated edges), including checking the
+// ancestors of cross-referenced nodes to find parent epics/batches.
+func (gc *graphCrawler) findCrossReferencedNode(fromKey string, targetType NodeType) *GraphNode {
+	// Parse the fromKey to get owner/repo/number
+	fromNode := gc.nodes[fromKey]
+	if fromNode == nil {
+		return nil
+	}
+
+	// Collect all cross-referenced nodes first
+	crossRefKeys := make([]string, 0)
+	for _, edge := range gc.edges {
+		// Check edges where this node is involved in a related (cross-ref) relationship
+		if edge.Relation != RelationTypeRelated {
+			continue
+		}
+
+		// Determine if this edge connects to our node and get the other end
+		var refKey string
+		isFrom := strings.EqualFold(edge.FromOwner, fromNode.Owner) &&
+			strings.EqualFold(edge.FromRepo, fromNode.Repo) &&
+			edge.FromNumber == fromNode.Number
+		isTo := strings.EqualFold(edge.ToOwner, fromNode.Owner) &&
+			strings.EqualFold(edge.ToRepo, fromNode.Repo) &&
+			edge.ToNumber == fromNode.Number
+
+		switch {
+		case isFrom:
+			refKey = nodeKey(edge.ToOwner, edge.ToRepo, edge.ToNumber)
+		case isTo:
+			refKey = nodeKey(edge.FromOwner, edge.FromRepo, edge.FromNumber)
+		default:
+			continue
+		}
+
+		crossRefKeys = append(crossRefKeys, refKey)
+	}
+
+	// First pass: check if any directly cross-referenced node is the target type
+	for _, refKey := range crossRefKeys {
+		if node, exists := gc.nodes[refKey]; exists && node.NodeType == targetType {
+			return node
+		}
+	}
+
+	// Second pass: check ancestors of cross-referenced nodes for the target type
+	// This handles the case where e.g., PR #461 is cross-ref'd by task #886,
+	// and #886's parent batch #871 is what we're looking for
+	for _, refKey := range crossRefKeys {
+		ancestors := gc.findAncestorsUnlocked(refKey)
+		for _, ancestorKey := range ancestors {
+			if node, exists := gc.nodes[ancestorKey]; exists && node.NodeType == targetType {
+				return node
+			}
+		}
+	}
+
+	return nil
+}
+
+// findAncestorsUnlocked finds all ancestors of a node (caller must hold lock)
+func (gc *graphCrawler) findAncestorsUnlocked(key string) []string {
+	ancestors := make([]string, 0)
+	seen := make(map[string]bool)
+	current := key
+
+	for {
+		parentKey, exists := gc.parentMap[current]
+		if !exists || seen[parentKey] {
+			break
+		}
+		seen[parentKey] = true
+		ancestors = append(ancestors, parentKey)
+		current = parentKey
+	}
+
+	return ancestors
+}
+
 // buildGraph constructs the final IssueGraph
 func (gc *graphCrawler) buildGraph() *IssueGraph {
 	gc.mu.RLock()
@@ -699,6 +1083,40 @@ func (gc *graphCrawler) buildGraph() *IssueGraph {
 	}
 }
 
+// writeFocusShiftInfo writes information about focus shifting to the summary
+func (gc *graphCrawler) writeFocusShiftInfo(sb *strings.Builder, focusNode *GraphNode) {
+	originalRef := formatNodeRef(gc.originalOwner, gc.originalRepo, gc.originalNumber, gc.focusOwner, gc.focusRepo)
+
+	// Case 1: Focus was successfully shifted
+	if gc.focusSource != FocusSourceProvided {
+		switch gc.focusSource {
+		case FocusSourceHierarchy:
+			fmt.Fprintf(sb, "Focus shifted: from %s via sub-issue/closes hierarchy\n", originalRef)
+		case FocusSourceCrossRef:
+			fmt.Fprintf(sb, "Focus shifted: from %s via cross-reference (found closest matching %s - verify this is the correct parent)\n",
+				originalRef, focusNode.NodeType)
+		}
+		return
+	}
+
+	// Case 2: Focus shift was requested but no suitable target found
+	if gc.focusRequested != "" {
+		// Check if the current focus already matches what was requested
+		requestedType := NodeType(gc.focusRequested)
+		if focusNode.NodeType == requestedType {
+			return // Already the right type, no message needed
+		}
+
+		// Focus shift failed - provide helpful suggestions
+		fmt.Fprintf(sb, "No %s found: searched hierarchy and cross-references from %s\n",
+			gc.focusRequested, originalRef)
+		sb.WriteString("Suggestions:\n")
+		fmt.Fprintf(sb, "  1. Provide a link: if you know the %s, share owner/repo#number\n", gc.focusRequested)
+		fmt.Fprintf(sb, "  2. Add a link: reference the %s in the issue body using 'Part of owner/repo#N'\n", gc.focusRequested)
+		fmt.Fprintf(sb, "  3. Create an %s: use issue_write to create a new tracking issue\n", gc.focusRequested)
+	}
+}
+
 // generateSummary creates a natural language summary of the graph
 func (gc *graphCrawler) generateSummary() string {
 	focusKey := nodeKey(gc.focusOwner, gc.focusRepo, gc.focusNumber)
@@ -709,10 +1127,23 @@ func (gc *graphCrawler) generateSummary() string {
 
 	var sb strings.Builder
 
-	// Focus node info
-	sb.WriteString(fmt.Sprintf("Focus: #%d (%s) \"%s\"\n",
-		gc.focusNumber, focusNode.NodeType, focusNode.Title))
-	sb.WriteString(fmt.Sprintf("State: %s\n", focusNode.State))
+	// Focus node info - include cross-repo reference if different from original
+	focusRef := fmt.Sprintf("#%d", gc.focusNumber)
+	if gc.focusOwner != gc.originalOwner || gc.focusRepo != gc.originalRepo {
+		focusRef = fmt.Sprintf("%s/%s#%d", gc.focusOwner, gc.focusRepo, gc.focusNumber)
+	}
+	sb.WriteString(fmt.Sprintf("Focus: %s (%s) \"%s\"\n",
+		focusRef, focusNode.NodeType, focusNode.Title))
+
+	// Show state with reason if available
+	stateStr := focusNode.State
+	if focusNode.StateReason != "" && focusNode.StateReason != focusNode.State {
+		stateStr = fmt.Sprintf("%s (%s)", focusNode.State, focusNode.StateReason)
+	}
+	sb.WriteString(fmt.Sprintf("State: %s\n", stateStr))
+
+	// Handle focus shift messaging
+	gc.writeFocusShiftInfo(&sb, focusNode)
 
 	// Find hierarchy path (ancestors)
 	ancestors := gc.findAncestors(focusKey)
@@ -795,23 +1226,10 @@ func (gc *graphCrawler) generateSummary() string {
 	return sb.String()
 }
 
-// findAncestors finds all ancestor nodes (parents) of a given node
+// findAncestors returns all ancestors (parents, grandparents, etc.) of a node.
+// Called after crawling is complete, so parentMap is stable and no lock needed.
 func (gc *graphCrawler) findAncestors(key string) []string {
-	ancestors := make([]string, 0)
-	visited := make(map[string]bool)
-	current := key
-
-	for {
-		parent, exists := gc.parentMap[current]
-		if !exists || visited[parent] {
-			break
-		}
-		visited[parent] = true
-		ancestors = append(ancestors, parent)
-		current = parent
-	}
-
-	return ancestors
+	return gc.findAncestorsUnlocked(key)
 }
 
 // formatNodeRef formats a node reference, using short form (#123) for same-repo
@@ -830,6 +1248,22 @@ func formatGraphOutput(graph *IssueGraph) string {
 	sb.WriteString("GRAPH SUMMARY\n")
 	sb.WriteString("=============\n")
 	sb.WriteString(graph.Summary)
+
+	// Project info for focus node (if available)
+	if len(graph.FocusProject) > 0 {
+		sb.WriteString("Projects: ")
+		projectParts := make([]string, 0, len(graph.FocusProject))
+		for _, p := range graph.FocusProject {
+			if p.Status != "" {
+				projectParts = append(projectParts, fmt.Sprintf("%s [%s]", p.ProjectTitle, p.Status))
+			} else {
+				projectParts = append(projectParts, p.ProjectTitle)
+			}
+		}
+		sb.WriteString(strings.Join(projectParts, ", "))
+		sb.WriteString("\n")
+	}
+
 	sb.WriteString("\n")
 
 	// Legend for node types
@@ -844,10 +1278,18 @@ func formatGraphOutput(graph *IssueGraph) string {
 			focusMarker = " [FOCUS]"
 		}
 		nodeRef := formatNodeRef(node.Owner, node.Repo, node.Number, graph.FocusOwner, graph.FocusRepo)
+		// Format state with reason if available (e.g., "closed (completed)" or "merged")
+		stateStr := node.State
+		if node.StateReason != "" && node.StateReason != node.State {
+			stateStr = fmt.Sprintf("%s (%s)", node.State, node.StateReason)
+		}
 		sb.WriteString(fmt.Sprintf("%s|%s|%s|%s%s\n",
-			nodeRef, node.NodeType, node.State, node.Title, focusMarker))
+			nodeRef, node.NodeType, stateStr, node.Title, focusMarker))
 		if node.BodyPreview != "" {
 			sb.WriteString(fmt.Sprintf("  Preview: %s\n", node.BodyPreview))
+		}
+		if node.StatusUpdate != "" {
+			sb.WriteString(fmt.Sprintf("  Status: %s\n", node.StatusUpdate))
 		}
 	}
 
@@ -903,24 +1345,201 @@ func formatGraphOutput(graph *IssueGraph) string {
 	return sb.String()
 }
 
+// IssueRef contains owner/repo/number for an issue reference
+type IssueRef struct {
+	Owner  string
+	Repo   string
+	Number int
+}
+
+// IssueGraphQLInfo contains parent, sub-issues, and project info fetched via GraphQL
+// This consolidates multiple API calls into a single efficient query
+type IssueGraphQLInfo struct {
+	Parent    *IssueRef     // Parent issue (if any)
+	SubIssues []IssueRef    // Sub-issues (can be cross-repo)
+	Projects  []ProjectInfo // Project items with status
+}
+
+// fetchIssueGraphQLInfo fetches parent, sub-issues, and project info in a single GraphQL query
+// This is more efficient than separate REST/GraphQL calls and handles cross-repo sub-issues
+func fetchIssueGraphQLInfo(ctx context.Context, gqlClient *githubv4.Client, owner, repo string, number int) *IssueGraphQLInfo {
+	if gqlClient == nil {
+		return nil
+	}
+
+	// Combined GraphQL query for parent, sub-issues, and projects
+	var query struct {
+		Repository struct {
+			Issue struct {
+				// Parent issue (can be cross-repo)
+				Parent *struct {
+					Number     githubv4.Int
+					Repository struct {
+						Owner struct {
+							Login githubv4.String
+						}
+						Name githubv4.String
+					}
+				}
+				// Sub-issues (can be cross-repo)
+				SubIssues struct {
+					Nodes []struct {
+						Number     githubv4.Int
+						Repository struct {
+							Owner struct {
+								Login githubv4.String
+							}
+							Name githubv4.String
+						}
+					}
+				} `graphql:"subIssues(first: 50)"`
+				// Project items with status
+				ProjectItems struct {
+					Nodes []struct {
+						Project struct {
+							Title githubv4.String
+						}
+						FieldValueByName struct {
+							SingleSelectValue struct {
+								Name githubv4.String
+							} `graphql:"... on ProjectV2ItemFieldSingleSelectValue"`
+						} `graphql:"fieldValueByName(name: \"Status\")"`
+					}
+				} `graphql:"projectItems(first: 10)"`
+			} `graphql:"issue(number: $number)"`
+		} `graphql:"repository(owner: $owner, name: $repo)"`
+	}
+
+	vars := map[string]interface{}{
+		"owner":  githubv4.String(owner),
+		"repo":   githubv4.String(repo),
+		"number": githubv4.Int(int32(number)), //nolint:gosec // issue numbers are always small positive integers
+	}
+
+	// Execute query with a short timeout
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	if err := gqlClient.Query(queryCtx, &query, vars); err != nil {
+		// Silently ignore errors - this info is optional
+		return nil
+	}
+
+	result := &IssueGraphQLInfo{}
+
+	// Extract parent
+	if query.Repository.Issue.Parent != nil {
+		result.Parent = &IssueRef{
+			Owner:  string(query.Repository.Issue.Parent.Repository.Owner.Login),
+			Repo:   string(query.Repository.Issue.Parent.Repository.Name),
+			Number: int(query.Repository.Issue.Parent.Number),
+		}
+	}
+
+	// Extract sub-issues (with their repos - can be cross-repo!)
+	for _, sub := range query.Repository.Issue.SubIssues.Nodes {
+		result.SubIssues = append(result.SubIssues, IssueRef{
+			Owner:  string(sub.Repository.Owner.Login),
+			Repo:   string(sub.Repository.Name),
+			Number: int(sub.Number),
+		})
+	}
+
+	// Extract projects
+	for _, node := range query.Repository.Issue.ProjectItems.Nodes {
+		title := string(node.Project.Title)
+		if title == "" {
+			continue
+		}
+		status := string(node.FieldValueByName.SingleSelectValue.Name)
+		result.Projects = append(result.Projects, ProjectInfo{
+			ProjectTitle: title,
+			Status:       status,
+		})
+	}
+
+	return result
+}
+
+// fetchPRProjects fetches project info for a PR (PRs don't have parent/sub-issues)
+func fetchPRProjects(ctx context.Context, gqlClient *githubv4.Client, owner, repo string, number int) []ProjectInfo {
+	if gqlClient == nil {
+		return nil
+	}
+
+	var query struct {
+		Repository struct {
+			PullRequest struct {
+				ProjectItems struct {
+					Nodes []struct {
+						Project struct {
+							Title githubv4.String
+						}
+						FieldValueByName struct {
+							SingleSelectValue struct {
+								Name githubv4.String
+							} `graphql:"... on ProjectV2ItemFieldSingleSelectValue"`
+						} `graphql:"fieldValueByName(name: \"Status\")"`
+					}
+				} `graphql:"projectItems(first: 10)"`
+			} `graphql:"pullRequest(number: $number)"`
+		} `graphql:"repository(owner: $owner, name: $repo)"`
+	}
+
+	vars := map[string]interface{}{
+		"owner":  githubv4.String(owner),
+		"repo":   githubv4.String(repo),
+		"number": githubv4.Int(int32(number)), //nolint:gosec // issue numbers are always small positive integers
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if err := gqlClient.Query(queryCtx, &query, vars); err != nil {
+		return nil
+	}
+
+	var projects []ProjectInfo
+	for _, node := range query.Repository.PullRequest.ProjectItems.Nodes {
+		title := string(node.Project.Title)
+		if title == "" {
+			continue
+		}
+		status := string(node.FieldValueByName.SingleSelectValue.Name)
+		projects = append(projects, ProjectInfo{
+			ProjectTitle: title,
+			Status:       status,
+		})
+	}
+
+	return projects
+}
+
 // GetIssueGraph creates a tool to get a graph representation of issue/PR relationships
-func GetIssueGraph(getClient GetClientFn, cache *lockdown.RepoAccessCache, t translations.TranslationHelperFunc, flags FeatureFlags) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+func GetIssueGraph(getClient GetClientFn, getGQLClient GetGQLClientFn, cache *lockdown.RepoAccessCache, t translations.TranslationHelperFunc, flags FeatureFlags) (tool mcp.Tool, handler server.ToolHandlerFunc) {
 	return mcp.NewTool("issue_graph",
-			mcp.WithDescription(t("TOOL_ISSUE_GRAPH_DESCRIPTION", `Get a graph representation of an issue or pull request and its related issues/PRs.
+			mcp.WithDescription(t("TOOL_ISSUE_GRAPH_DESCRIPTION", `**PRIMARY TOOL FOR ISSUE/PR/PROJECT STATUS** - Returns the entire work hierarchy in ONE call. Use this FIRST before issue_read or other tools.
 
-This tool helps understand the relationships between issues and PRs in a repository, especially useful for:
-- Understanding the scope of work for an issue or PR
-- Planning implementation for a task that's part of a larger epic
-- Identifying blockers or dependencies
-- Finding related work that might conflict or overlap
-- Understanding why a piece of work exists (tracing to parent epic)
+FASTEST PATH TO PROJECT STATUS: One call returns all related issues, PRs, and their states - no need for multiple API calls.
 
-The graph shows:
+MUST USE THIS TOOL FIRST WHEN USER ASKS:
+- "update on..." / "status of..." / "progress on..." / "tell me about..."
+- "what's happening with..." / "how is... going" / "state of..."
+- "project status" / "overall progress" / "how is the epic going"
+- "epic" / "parent issue" / "sub-issues" / "blocking" / "depends on"
+- ANY request for status on work that might span multiple issues
+
+DO NOT use issue_read or list_issues first for status questions - issue_graph returns everything in one call.
+
+Returns a comprehensive view including:
 - Node types: epic (large initiatives), batch (parent issues), task (regular issues), pr (pull requests)
-- Parent/child relationships from sub-issues and "closes/fixes" references
-- Related issues mentioned in bodies
+- Full hierarchy: epic → batch → task → PR relationships across the ENTIRE project
+- Sub-issues and "closes/fixes" references
+- Cross-references and related work
+- Status updates extracted from issue bodies and comments
+- Open/closed/merged state of ALL related items
 
-Call this tool early when working on an issue to gather appropriate context about the work hierarchy.`)),
+Use focus="epic" to automatically find and focus on the parent epic of any issue.`)),
 			mcp.WithToolAnnotation(mcp.ToolAnnotation{
 				Title:        t("TOOL_ISSUE_GRAPH_USER_TITLE", "Get issue relationship graph"),
 				ReadOnlyHint: ToBoolPtr(true),
@@ -937,6 +1556,10 @@ Call this tool early when working on an issue to gather appropriate context abou
 				mcp.Required(),
 				mcp.Description("Issue or pull request number to build the graph from"),
 			),
+			mcp.WithString("focus",
+				mcp.Description("Which node type to focus on: 'provided' (default) uses the specified issue/PR, 'epic' shifts focus to the nearest epic in the hierarchy, 'batch' shifts focus to the nearest batch/parent issue"),
+				mcp.Enum("provided", "epic", "batch"),
+			),
 		),
 		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			owner, err := RequiredParam[string](request, "owner")
@@ -951,10 +1574,23 @@ Call this tool early when working on an issue to gather appropriate context abou
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
+			focusType, err := OptionalParam[string](request, "focus")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if focusType == "" {
+				focusType = "provided"
+			}
 
 			client, err := getClient(ctx)
 			if err != nil {
 				return nil, fmt.Errorf("failed to get GitHub client: %w", err)
+			}
+
+			// Get GQL client for parent queries (optional, nil is ok)
+			var gqlClient *githubv4.Client
+			if getGQLClient != nil {
+				gqlClient, _ = getGQLClient(ctx) // ignore error, gqlClient will be nil
 			}
 
 			// Add timeout to prevent runaway crawling
@@ -962,7 +1598,7 @@ Call this tool early when working on an issue to gather appropriate context abou
 			defer cancel()
 
 			// Create crawler and build graph
-			crawler := newGraphCrawler(client, cache, flags, owner, repo, issueNumber)
+			crawler := newGraphCrawler(client, gqlClient, cache, flags, owner, repo, issueNumber)
 			if err := crawler.crawl(crawlCtx); err != nil {
 				// If timeout, continue with partial results; otherwise fail
 				if crawlCtx.Err() != context.DeadlineExceeded {
@@ -970,7 +1606,38 @@ Call this tool early when working on an issue to gather appropriate context abou
 				}
 			}
 
+			// Refocus if requested
+			if focusType != "provided" {
+				crawler.focusRequested = focusType
+				newOwner, newRepo, newNumber, source := crawler.findBestFocus(focusType)
+				if newOwner != owner || newRepo != repo || newNumber != issueNumber {
+					crawler.refocusTo(newOwner, newRepo, newNumber, source)
+				}
+			}
+
 			graph := crawler.buildGraph()
+
+			// Fetch project info for the focus node (optional, best-effort)
+			if gqlClient != nil {
+				// Determine if focus node is a PR
+				focusKey := nodeKey(graph.FocusOwner, graph.FocusRepo, graph.FocusNumber)
+				isPR := false
+				crawler.mu.RLock()
+				if focusNode, exists := crawler.nodes[focusKey]; exists {
+					isPR = focusNode.NodeType == NodeTypePR
+				}
+				crawler.mu.RUnlock()
+
+				// Use appropriate fetch based on type
+				if isPR {
+					graph.FocusProject = fetchPRProjects(ctx, gqlClient, graph.FocusOwner, graph.FocusRepo, graph.FocusNumber)
+				} else {
+					// For issues, we already fetched this during crawl - get from combined query
+					if info := fetchIssueGraphQLInfo(ctx, gqlClient, graph.FocusOwner, graph.FocusRepo, graph.FocusNumber); info != nil {
+						graph.FocusProject = info.Projects
+					}
+				}
+			}
 
 			// Format for LLM consumption - text format is token-efficient and sufficient
 			formattedOutput := formatGraphOutput(graph)

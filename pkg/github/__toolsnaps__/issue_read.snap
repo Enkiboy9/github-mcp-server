@@ -3,7 +3,7 @@
     "title": "Get issue details",
     "readOnlyHint": true
   },
-  "description": "Get information about a specific issue in a GitHub repository.",
+  "description": "Get detailed information about a single issue: full body, comments, sub-issues, or labels.\n\n**USE issue_graph INSTEAD when user asks about:**\n- Status, updates, or progress on issues/PRs/epics\n- Project overview or how work is going\n- Parent issues, sub-issues, or work hierarchy\n- Related or blocking issues\n\nissue_read is for: reading the full issue body, fetching comments, listing sub-issues of a known parent, or getting label details - AFTER you already know which specific issue you need.",
   "inputSchema": {
     "properties": {
       "issue_number": {
