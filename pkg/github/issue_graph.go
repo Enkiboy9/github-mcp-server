@@ -2,7 +2,6 @@ package github
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -923,18 +922,9 @@ Call this tool early when working on an issue to gather appropriate context abou
 
 			graph := crawler.buildGraph()
 
-			// Format for LLM consumption
+			// Format for LLM consumption - text format is token-efficient and sufficient
 			formattedOutput := formatGraphOutput(graph)
 
-			// Also include JSON for structured access
-			jsonData, err := json.Marshal(graph)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal graph: %w", err)
-			}
-
-			// Return both human-readable and JSON format
-			result := fmt.Sprintf("%s\n\nJSON_DATA:\n%s", formattedOutput, string(jsonData))
-
-			return mcp.NewToolResultText(result), nil
+			return mcp.NewToolResultText(formattedOutput), nil
 		}
 }
