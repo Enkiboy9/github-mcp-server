@@ -110,10 +110,27 @@ var (
 	whitespaceRegex = regexp.MustCompile(`\s+`)
 	// HTML tags to remove
 	htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
+	// Code block patterns to remove before extracting references
+	fencedCodeBlockRegex = regexp.MustCompile("(?s)```[^`]*```")
+	inlineCodeRegex      = regexp.MustCompile("`[^`]+`")
 )
 
+// stripCodeBlocks removes fenced code blocks and inline code from text
+// This prevents extracting issue references from example code
+func stripCodeBlocks(text string) string {
+	// Remove fenced code blocks first (```...```)
+	text = fencedCodeBlockRegex.ReplaceAllString(text, "")
+	// Remove inline code (`...`)
+	text = inlineCodeRegex.ReplaceAllString(text, "")
+	return text
+}
+
 // extractIssueReferences extracts all issue/PR references from text
+// It strips code blocks first to avoid picking up example references
 func extractIssueReferences(text, defaultOwner, defaultRepo string) []IssueReference {
+	// Strip code blocks to avoid extracting references from examples
+	text = stripCodeBlocks(text)
+
 	refs := make([]IssueReference, 0)
 	seen := make(map[string]bool)
 
@@ -495,6 +512,11 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 
 			refKey := nodeKey(ref.Owner, ref.Repo, ref.Number)
 
+			// Skip self-references
+			if refKey == key {
+				continue
+			}
+
 			// Determine relationship
 			relType := RelationTypeRelated
 			if ref.IsParent {
@@ -629,6 +651,14 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 	return nil
 }
 
+// edgeKey creates a unique key for an edge to enable deduplication
+func edgeKey(e GraphEdge) string {
+	return fmt.Sprintf("%s/%s#%d->%s/%s#%d:%s",
+		strings.ToLower(e.FromOwner), strings.ToLower(e.FromRepo), e.FromNumber,
+		strings.ToLower(e.ToOwner), strings.ToLower(e.ToRepo), e.ToNumber,
+		e.Relation)
+}
+
 // buildGraph constructs the final IssueGraph
 func (gc *graphCrawler) buildGraph() *IssueGraph {
 	gc.mu.RLock()
@@ -648,12 +678,23 @@ func (gc *graphCrawler) buildGraph() *IssueGraph {
 		return nodes[i].Number < nodes[j].Number
 	})
 
+	// Deduplicate edges
+	seenEdges := make(map[string]bool)
+	uniqueEdges := make([]GraphEdge, 0, len(gc.edges))
+	for _, edge := range gc.edges {
+		key := edgeKey(edge)
+		if !seenEdges[key] {
+			seenEdges[key] = true
+			uniqueEdges = append(uniqueEdges, edge)
+		}
+	}
+
 	return &IssueGraph{
 		FocusOwner:  gc.focusOwner,
 		FocusRepo:   gc.focusRepo,
 		FocusNumber: gc.focusNumber,
 		Nodes:       nodes,
-		Edges:       gc.edges,
+		Edges:       uniqueEdges,
 		Summary:     gc.generateSummary(),
 	}
 }
