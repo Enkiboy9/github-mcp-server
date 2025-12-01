@@ -559,6 +559,72 @@ func (gc *graphCrawler) crawl(ctx context.Context) error {
 				_ = subResp.Body.Close()
 			}
 		}
+
+		// Get cross-referenced issues from timeline
+		timelineEvents, timelineResp, err := gc.client.Issues.ListIssueTimeline(ctx, current.owner, current.repo, current.number, &github.ListOptions{
+			PerPage: 100,
+		})
+		if err == nil {
+			for _, event := range timelineEvents {
+				// Only process cross-referenced events
+				if event.GetEvent() != "cross-referenced" {
+					continue
+				}
+
+				source := event.GetSource()
+				if source == nil {
+					continue
+				}
+
+				sourceIssue := source.GetIssue()
+				if sourceIssue == nil || sourceIssue.Number == nil {
+					continue
+				}
+
+				// Parse repository info from the source issue URL
+				refOwner, refRepo := current.owner, current.repo
+				if sourceIssue.RepositoryURL != nil {
+					// URL format: https://api.github.com/repos/{owner}/{repo}
+					parts := strings.Split(*sourceIssue.RepositoryURL, "/")
+					if len(parts) >= 2 {
+						refOwner = parts[len(parts)-2]
+						refRepo = parts[len(parts)-1]
+					}
+				}
+
+				// Skip if repo is known to be inaccessible
+				if gc.isRepoInaccessible(refOwner, refRepo) {
+					continue
+				}
+
+				refNumber := *sourceIssue.Number
+				refKey := nodeKey(refOwner, refRepo, refNumber)
+
+				// Skip self-references
+				if refKey == key {
+					continue
+				}
+
+				// Add edge (the source issue mentioned this issue)
+				gc.mu.Lock()
+				gc.edges = append(gc.edges, GraphEdge{
+					FromOwner:  refOwner,
+					FromRepo:   refRepo,
+					FromNumber: refNumber,
+					ToOwner:    current.owner,
+					ToRepo:     current.repo,
+					ToNumber:   current.number,
+					Relation:   RelationTypeRelated,
+				})
+				gc.mu.Unlock()
+
+				// Add to queue for further crawling
+				queue = append(queue, crawlItem{refOwner, refRepo, refNumber, current.depth + 1})
+			}
+		}
+		if timelineResp != nil {
+			_ = timelineResp.Body.Close()
+		}
 	}
 
 	return nil
